@@ -1,0 +1,914 @@
+# bot.py
+# ─────────────────────────────────────────────────────────────
+# Fake OTP Telegram Bot
+#   pip install -r requirements.txt
+#   export OTP_BOT_TOKEN="..."
+#   export OTP_OWNER_ID="..."
+#   export OTP_GROUP_ID="..."
+#   python bot.py
+# ─────────────────────────────────────────────────────────────
+
+import asyncio
+import logging
+import logging.handlers
+import os
+import random
+import sqlite3
+import string
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from jinja2 import Environment, BaseLoader, TemplateError
+
+# ─────────── telegram imports (version-tolerant) ───────────
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.constants import ParseMode
+from telegram.error import TelegramError, RetryAfter, Forbidden, BadRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# CopyTextButton exists in python-telegram-bot >= 21.11.
+try:
+    from telegram import CopyTextButton  # type: ignore
+    _COPY_SUPPORTED = True
+except ImportError:
+    class CopyTextButton:
+        def __init__(self, text: str):
+            self.text = text
+    _COPY_SUPPORTED = False
+
+# Button style ("danger" / "primary" / "success") exists in PTB >= 21.11 too.
+try:
+    from telegram import InlineKeyboardButton as _IKB  # noqa
+    _STYLE_SUPPORTED = "style" in _IKB.__init__.__code__.co_varnames
+except Exception:
+    _STYLE_SUPPORTED = False
+
+def _btn(label: str, *, url: Optional[str] = None,
+         copy_text: Optional[CopyTextButton] = None,
+         style: Optional[str] = None) -> InlineKeyboardButton:
+    """Build an InlineKeyboardButton, applying style only if supported."""
+    kwargs = {"text": label}
+    if url is not None:
+        kwargs["url"] = url
+    if copy_text is not None:
+        kwargs["copy_text"] = copy_text
+    if style is not None and _STYLE_SUPPORTED:
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
+
+# ═════════════════════════════════════════════════════════════
+# CONFIG
+# ═════════════════════════════════════════════════════════════
+BOT_TOKEN        = os.getenv("OTP_BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")
+OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "123456789"))
+DEFAULT_GROUP_ID = int(os.getenv("OTP_GROUP_ID", "-1001234567890"))
+DB_PATH          = os.getenv("OTP_DB_PATH", "otp_bot.sqlite3")
+LOG_PATH         = os.getenv("OTP_LOG_PATH", "otp_bot.log")
+DRY_RUN          = os.getenv("OTP_DRY_RUN", "0") == "1"
+
+# ─────────────────────────────────────────────────────────────
+# BUTTON URLS — paste your own values here
+# ─────────────────────────────────────────────────────────────
+NUMBERS_URL = "https://t.me/your_numbers_channel"
+CHAT_URL    = "https://t.me/your_chat"
+BOT_URL     = "https://t.me/your_bot"
+
+# Show the "Tap to copy" (red) row above the links.
+SHOW_COPY_BUTTON = True
+
+# ═════════════════════════════════════════════════════════════
+# LOGGING
+# ═════════════════════════════════════════════════════════════
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("otpbot")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+log = setup_logging()
+
+# ═════════════════════════════════════════════════════════════
+# UNICODE BOLD
+# ═════════════════════════════════════════════════════════════
+BOLD_DIGITS = str.maketrans("0123456789", "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗")
+BOLD_LATIN  = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳",
+)
+
+def bold(text: str) -> str:
+    return text.translate(BOLD_DIGITS).translate(BOLD_LATIN)
+
+# ═════════════════════════════════════════════════════════════
+# DATABASE
+# ═════════════════════════════════════════════════════════════
+def db_init() -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS templates (
+                country TEXT PRIMARY KEY,
+                body    TEXT NOT NULL,
+                updated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS stats (
+                day     TEXT NOT NULL,
+                country TEXT NOT NULL,
+                count   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, country)
+            );
+            CREATE TABLE IF NOT EXISTS audit (
+                ts      INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                action  TEXT NOT NULL,
+                detail  TEXT
+            );
+            """
+        )
+        defaults = {
+            "group_id":     str(DEFAULT_GROUP_ID),
+            "interval_min": "5",
+            "interval_max": "12",
+            "autopost":     "0",
+            "country":      "VE",
+            "numbers_url":  NUMBERS_URL,
+            "chat_url":     CHAT_URL,
+            "bot_url":      BOT_URL,
+            "active_from":  "00:00",
+            "active_to":    "23:59",
+            "pinned_note":  "",
+            "prefix":       "KITE",
+            "counter":      "0",
+            "dry_run":      "0",
+        }
+        for k, v in defaults.items():
+            con.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
+        con.commit()
+    log.info("db initialised at %s", DB_PATH)
+
+def get_setting(key: str, default: str = "") -> str:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+def set_setting(key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        con.commit()
+
+def bump_counter(country: str) -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO stats(day, country, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(day, country) DO UPDATE SET count = count + 1",
+            (today, country),
+        )
+        con.execute("UPDATE settings SET value = CAST(value AS INTEGER) + 1 WHERE key = 'counter'")
+        con.commit()
+        row = con.execute("SELECT value FROM settings WHERE key = 'counter'").fetchone()
+        return int(row[0]) if row else 0
+
+def get_stats(days: int = 7) -> dict:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            "SELECT day, country, count FROM stats WHERE day >= ? ORDER BY day DESC",
+            (cutoff,),
+        ).fetchall()
+    return {"rows": rows}
+
+def audit(user_id: int, action: str, detail: str = "") -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO audit(ts, user_id, action, detail) VALUES (?, ?, ?, ?)",
+            (int(time.time()), user_id, action, detail),
+        )
+        con.commit()
+
+def is_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+    return row is not None
+
+def add_admin(user_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT OR IGNORE INTO admins(user_id, added_at) VALUES (?, ?)",
+            (user_id, int(time.time())),
+        )
+        con.commit()
+
+def remove_admin(user_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        con.commit()
+
+def list_admins() -> list:
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute("SELECT user_id FROM admins ORDER BY added_at").fetchall()
+    return [r[0] for r in rows]
+
+# ═════════════════════════════════════════════════════════════
+# COUNTRY REGISTRY
+# ═════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class Country:
+    code: str
+    flag: str
+    label: str
+    lang_tag: str
+    default_prefix: str
+
+COUNTRIES = {
+    "VE": Country("VE", "🇻🇪", "Venezuela",       "English",    "KITE"),
+    "ID": Country("ID", "🇮🇩", "Indonesia",       "English",    "KITE"),
+    "US": Country("US", "🇺🇸", "United States",   "English",    "KITE"),
+    "GB": Country("GB", "🇬🇧", "United Kingdom",  "English",    "KITE"),
+    "RU": Country("RU", "🇷🇺", "Russia",          "Russian",    "KITE"),
+    "IN": Country("IN", "🇮🇳", "India",           "English",    "KITE"),
+    "BR": Country("BR", "🇧🇷", "Brazil",          "Portuguese", "KITE"),
+    "NG": Country("NG", "🇳🇬", "Nigeria",         "English",    "KITE"),
+    "PH": Country("PH", "🇵🇭", "Philippines",     "English",    "KITE"),
+    "MX": Country("MX", "🇲🇽", "Mexico",          "Spanish",    "KITE"),
+    "PK": Country("PK", "🇵🇰", "Pakistan",        "English",    "KITE"),
+    "EG": Country("EG", "🇪🇬", "Egypt",           "Arabic",     "KITE"),
+    "TR": Country("TR", "🇹🇷", "Turkey",          "Turkish",    "KITE"),
+    "DE": Country("DE", "🇩🇪", "Germany",         "German",     "KITE"),
+    "FR": Country("FR", "🇫🇷", "France",          "French",     "KITE"),
+}
+
+# ═════════════════════════════════════════════════════════════
+# TEMPLATE ENGINE
+# ═════════════════════════════════════════════════════════════
+DEFAULT_TEMPLATE = """\
+🌍 ┃ 📱
+#{{ code_bold }}  {{ mid_bold }}-{{ tail_bold }}  🌐#{{ lang_tag }}"""
+
+JINJA = Environment(loader=BaseLoader(), autoescape=False)
+
+def get_template(country: str) -> str:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT body FROM templates WHERE country = ?", (country,)).fetchone()
+    return row[0] if row else DEFAULT_TEMPLATE
+
+def set_template(country: str, body: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO templates(country, body, updated) VALUES (?, ?, ?) "
+            "ON CONFLICT(country) DO UPDATE SET body = excluded.body, updated = excluded.updated",
+            (country, body, int(time.time())),
+        )
+        con.commit()
+
+def render_otp(country_code: str):
+    cc = COUNTRIES.get(country_code, COUNTRIES["VE"])
+    digits    = "".join(random.choices(string.digits, k=6))
+    secondary = "".join(random.choices(string.digits, k=5))
+    prefix    = get_setting("prefix") or cc.default_prefix
+    mid       = f"{prefix}-{digits}"
+    tail      = secondary
+
+    body_tmpl = get_template(cc.code)
+    try:
+        tmpl = JINJA.from_string(body_tmpl)
+        text = tmpl.render(
+            code_bold=bold(cc.code),
+            mid_bold=bold(mid),
+            tail_bold=bold(tail),
+            lang_tag=cc.lang_tag,
+            flag=cc.flag,
+            country=cc.code,
+            prefix=prefix,
+            digits=digits,
+            tail=tail,
+        )
+    except TemplateError as e:
+        log.warning("template render failed for %s: %s", cc.code, e)
+        text = f"#{bold(cc.code)}  {bold(mid)}-{bold(tail)}  🌐#{cc.lang_tag}"
+
+    # The copy button carries a fresh 6-digit code (independent of display)
+    copy_code = "".join(random.choices(string.digits, k=6))
+    return text, copy_code
+
+def build_keyboard(raw_code: str) -> InlineKeyboardMarkup:
+    rows = []
+
+    if SHOW_COPY_BUTTON and _COPY_SUPPORTED:
+        rows.append([
+            _btn(f"📋 {raw_code}", copy_text=CopyTextButton(text=raw_code), style="danger")
+        ])
+
+    rows.append([
+        _btn("📞 Numbers", url=get_setting("numbers_url") or NUMBERS_URL, style="danger"),
+        _btn("💬 Chat",    url=get_setting("chat_url")    or CHAT_URL,    style="primary"),
+        _btn("🤖 Bot",     url=get_setting("bot_url")     or BOT_URL,     style="primary"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+# ═════════════════════════════════════════════════════════════
+# ACTIVE-HOURS WINDOW
+# ═════════════════════════════════════════════════════════════
+def within_active_window() -> bool:
+    try:
+        now = datetime.now(timezone.utc).time()
+        frm = datetime.strptime(get_setting("active_from", "00:00"), "%H:%M").time()
+        to  = datetime.strptime(get_setting("active_to",   "23:59"), "%H:%M").time()
+    except Exception:
+        return True
+    if frm <= to:
+        return frm <= now <= to
+    return now >= frm or now <= to
+
+# ═════════════════════════════════════════════════════════════
+# POSTING
+# ═════════════════════════════════════════════════════════════
+async def post_otp(app: Application, chat_id: int, force: bool = False) -> bool:
+    if not force and not within_active_window():
+        return False
+
+    cc_code = get_setting("country")
+    text, raw = render_otp(cc_code)
+    kb = build_keyboard(raw)
+
+    note = get_setting("pinned_note")
+    if note:
+        text = f"{text}\n\n📌 {note}"
+
+    if DRY_RUN or get_setting("dry_run") == "1":
+        log.info("[DRY-RUN] would post to %s: %s", chat_id, text.replace("\n", " | "))
+        return True
+
+    try:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        bump_counter(cc_code)
+        log.info("posted OTP to %s country=%s", chat_id, cc_code)
+        return True
+    except RetryAfter as e:
+        log.warning("rate limited, sleeping %ss", e.retry_after)
+        await asyncio.sleep(e.retry_after + 1)
+        return await post_otp(app, chat_id, force=force)
+    except (Forbidden, BadRequest) as e:
+        log.error("send failed to %s: %s", chat_id, e)
+        return False
+    except TelegramError as e:
+        log.error("telegram error: %s", e)
+        return False
+
+async def autopost_loop(app: Application) -> None:
+    while True:
+        try:
+            if get_setting("autopost") == "1":
+                try:
+                    lo = max(1, int(get_setting("interval_min", "5")))
+                    hi = max(lo, int(get_setting("interval_max", "12")))
+                except ValueError:
+                    lo, hi = 5, 12
+
+                try:
+                    gid = int(get_setting("group_id"))
+                    await post_otp(app, gid)
+                except Exception as e:
+                    log.exception("post failed: %s", e)
+
+                await asyncio.sleep(random.uniform(lo, hi))
+            else:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            log.exception("autopost loop error")
+            await asyncio.sleep(2)
+
+# ═════════════════════════════════════════════════════════════
+# AUTH DECORATOR
+# ═════════════════════════════════════════════════════════════
+def admin_only(func):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id if update.effective_user else 0
+        if not is_admin(uid):
+            if update.effective_message:
+                try:
+                    await update.effective_message.delete()
+                except Exception:
+                    pass
+            return
+        return await func(update, ctx)
+    return wrapper
+
+# ═════════════════════════════════════════════════════════════
+# COUNTRY PICKER (inline menu)
+# ═════════════════════════════════════════════════════════════
+def country_menu_kb() -> InlineKeyboardMarkup:
+    current = get_setting("country")
+    rows = []
+    per_row = 3
+    items = list(COUNTRIES.values())
+    for i in range(0, len(items), per_row):
+        chunk = items[i:i + per_row]
+        row = []
+        for c in chunk:
+            mark = "✅ " if c.code == current else ""
+            row.append(_btn(
+                f"{mark}{c.flag} {c.code}",
+                style="success" if c.code == current else None,
+            ))
+            # NOTE: buttons without url/copy have no payload unless we add callback_data.
+            # We'll rebuild with callback_data below.
+        rows.append(row)
+    # Rebuild properly with callback_data (can't mix _btn kwargs here cleanly)
+    rows = []
+    for i in range(0, len(items), per_row):
+        chunk = items[i:i + per_row]
+        row = []
+        for c in chunk:
+            label = ("✅ " if c.code == current else "") + f"{c.flag} {c.code}"
+            row.append(InlineKeyboardButton(label, callback_data=f"cc:{c.code}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Close", callback_data="cc:__close__")])
+    return InlineKeyboardMarkup(rows)
+
+@admin_only
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🌍 Select country:",
+        reply_markup=country_menu_kb(),
+    )
+
+@admin_only
+async def cmd_country_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cmd_menu(update, ctx)
+
+# ═════════════════════════════════════════════════════════════
+# COMMANDS
+# ═════════════════════════════════════════════════════════════
+@admin_only
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👑 <b>Owner / Admin panel</b>\n\n"
+        "<b>Posting</b>\n"
+        "/send — post one OTP now\n"
+        "/preview — preview OTP in DM\n"
+        "/menu — open country picker\n"
+        "/start_auto — enable autopost\n"
+        "/stop_auto — disable autopost\n"
+        "/speed &lt;min&gt; &lt;max&gt; — randomized cadence window\n"
+        "/active &lt;HH:MM&gt; &lt;HH:MM&gt; — posting window (UTC)\n"
+        "/dryrun &lt;0|1&gt; — toggle dry-run\n\n"
+        "<b>Target</b>\n"
+        "/setgroup &lt;chat_id&gt;\n"
+        "/setlinks &lt;numbers&gt; &lt;chat&gt; &lt;bot&gt;\n"
+        "/setprefix &lt;PREFIX&gt;\n\n"
+        "<b>Countries</b>\n"
+        "/country &lt;CC&gt; / /menu — picker\n"
+        "/countries — list\n\n"
+        "<b>Templates</b>\n"
+        "/template &lt;CC&gt; / /settemplate &lt;CC&gt; &lt;body&gt; / /resettemplate &lt;CC&gt;\n\n"
+        "<b>Broadcast &amp; Moderation</b>\n"
+        "/broadcast &lt;text&gt; / /pin &lt;text&gt; / /note &lt;text&gt;\n\n"
+        "<b>Admins</b>\n"
+        "/addadmin &lt;user_id&gt; / /deladmin &lt;user_id&gt; / /admins\n\n"
+        "<b>Analytics</b>\n"
+        "/stats / /history [days] / /health\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+@admin_only
+async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    gid = int(get_setting("group_id"))
+    ok = await post_otp(ctx.application, gid, force=True)
+    await update.message.reply_text("✅ sent." if ok else "❌ failed (see logs).")
+    audit(update.effective_user.id, "send", f"gid={gid}")
+
+@admin_only
+async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text, raw = render_otp(get_setting("country"))
+    note = get_setting("pinned_note")
+    if note:
+        text += f"\n\n📌 {note}"
+    await update.message.reply_text(
+        text, reply_markup=build_keyboard(raw), parse_mode=ParseMode.HTML
+    )
+
+@admin_only
+async def cmd_start_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_setting("autopost", "1")
+    audit(update.effective_user.id, "autopost_on")
+    await update.message.reply_text(
+        f"▶️ autopost ON — window {get_setting('interval_min')}–{get_setting('interval_max')}s"
+    )
+
+@admin_only
+async def cmd_stop_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    set_setting("autopost", "0")
+    audit(update.effective_user.id, "autopost_off")
+    await update.message.reply_text("⏸ autopost OFF")
+
+@admin_only
+async def cmd_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 2 or not all(a.isdigit() for a in ctx.args[:2]):
+        await update.message.reply_text("usage: /speed <min_sec> <max_sec>")
+        return
+    lo, hi = int(ctx.args[0]), int(ctx.args[1])
+    if lo < 1 or hi < lo:
+        await update.message.reply_text("invalid range")
+        return
+    set_setting("interval_min", str(lo))
+    set_setting("interval_max", str(hi))
+    await update.message.reply_text(f"⚡ cadence = {lo}–{hi}s (randomized)")
+
+@admin_only
+async def cmd_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 2:
+        await update.message.reply_text("usage: /active HH:MM HH:MM")
+        return
+    try:
+        datetime.strptime(ctx.args[0], "%H:%M")
+        datetime.strptime(ctx.args[1], "%H:%M")
+    except ValueError:
+        await update.message.reply_text("bad time format")
+        return
+    set_setting("active_from", ctx.args[0])
+    set_setting("active_to",   ctx.args[1])
+    await update.message.reply_text(f"🕒 active window = {ctx.args[0]} → {ctx.args[1]} (UTC)")
+
+@admin_only
+async def cmd_dryrun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(f"dry_run = {get_setting('dry_run')}")
+        return
+    set_setting("dry_run", "1" if ctx.args[0] == "1" else "0")
+    await update.message.reply_text(f"🧪 dry_run = {get_setting('dry_run')}")
+
+@admin_only
+async def cmd_setgroup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or not ctx.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("usage: /setgroup <chat_id>")
+        return
+    set_setting("group_id", ctx.args[0])
+    await update.message.reply_text(f"🎯 group_id = {ctx.args[0]}")
+
+@admin_only
+async def cmd_setlinks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 3:
+        await update.message.reply_text("usage: /setlinks <numbers> <chat> <bot>")
+        return
+    set_setting("numbers_url", ctx.args[0])
+    set_setting("chat_url",    ctx.args[1])
+    set_setting("bot_url",     ctx.args[2])
+    await update.message.reply_text("🔗 links updated.")
+
+@admin_only
+async def cmd_setprefix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("usage: /setprefix <PREFIX>")
+        return
+    set_setting("prefix", ctx.args[0].upper())
+    await update.message.reply_text(f"🏷 prefix = {ctx.args[0].upper()}")
+
+@admin_only
+async def cmd_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("usage: /country <CC>  (or /menu)")
+        return
+    cc = ctx.args[0].upper()
+    if cc not in COUNTRIES:
+        await update.message.reply_text("unknown. see /countries")
+        return
+    set_setting("country", cc)
+    await update.message.reply_text(f"🌍 country = {cc} — {COUNTRIES[cc].label}")
+
+@admin_only
+async def cmd_countries(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    lines = [f"{c.flag} <code>{c.code}</code> — {c.label} ({c.lang_tag})" for c in COUNTRIES.values()]
+    await update.message.reply_text(
+        "Supported:\n" + "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+@admin_only
+async def cmd_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("usage: /template <CC>")
+        return
+    cc = ctx.args[0].upper()
+    body = get_template(cc)
+    await update.message.reply_text(
+        f"<b>{cc}</b> template:\n<pre>{body}</pre>", parse_mode=ParseMode.HTML
+    )
+
+@admin_only
+async def cmd_settemplate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "usage: /settemplate <CC> <body>\n"
+            "vars: {{code_bold}} {{mid_bold}} {{tail_bold}} {{lang_tag}} "
+            "{{flag}} {{prefix}} {{digits}} {{tail}}"
+        )
+        return
+    cc = ctx.args[0].upper()
+    body = update.message.text.split(" ", 2)[2]
+    set_template(cc, body)
+    await update.message.reply_text(f"✅ template set for {cc}")
+
+@admin_only
+async def cmd_resettemplate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("usage: /resettemplate <CC>")
+        return
+    cc = ctx.args[0].upper()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM templates WHERE country = ?", (cc,))
+        con.commit()
+    await update.message.reply_text(f"↺ template reset for {cc}")
+
+@admin_only
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("usage: /broadcast <text>")
+        return
+    text = update.message.text.split(" ", 1)[1]
+    gid = int(get_setting("group_id"))
+    try:
+        await ctx.application.bot.send_message(
+            gid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+        await update.message.reply_text("📣 broadcast sent.")
+        audit(update.effective_user.id, "broadcast", text[:80])
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+@admin_only
+async def cmd_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("usage: /pin <text>")
+        return
+    text = update.message.text.split(" ", 1)[1]
+    gid = int(get_setting("group_id"))
+    try:
+        msg = await ctx.application.bot.send_message(gid, text, parse_mode=ParseMode.HTML)
+        await msg.pin(disable_notification=True)
+        await update.message.reply_text("📌 pinned.")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+@admin_only
+async def cmd_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(f"note = {get_setting('pinned_note') or '(empty)'}")
+        return
+    text = update.message.text.split(" ", 1)[1]
+    set_setting("pinned_note", text)
+    await update.message.reply_text("📝 note saved.")
+
+async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid != OWNER_ID:
+        return
+    if not ctx.args or not ctx.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("usage: /addadmin <user_id>")
+        return
+    add_admin(int(ctx.args[0]))
+    await update.message.reply_text(f"➕ admin {ctx.args[0]}")
+
+async def cmd_deladmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid != OWNER_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("usage: /deladmin <user_id>")
+        return
+    remove_admin(int(ctx.args[0]))
+    await update.message.reply_text(f"➖ admin {ctx.args[0]}")
+
+async def cmd_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid != OWNER_ID:
+        return
+    ids = [OWNER_ID] + list_admins()
+    await update.message.reply_text("👥 admins:\n" + "\n".join(f"• {i}" for i in ids))
+
+@admin_only
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"📊 <b>current config</b>\n"
+        f"group    : <code>{get_setting('group_id')}</code>\n"
+        f"country  : {get_setting('country')}\n"
+        f"cadence  : {get_setting('interval_min')}–{get_setting('interval_max')}s\n"
+        f"window   : {get_setting('active_from')} → {get_setting('active_to')} UTC\n"
+        f"autopost : {'ON' if get_setting('autopost') == '1' else 'OFF'}\n"
+        f"dry_run  : {get_setting('dry_run')}\n"
+        f"prefix   : {get_setting('prefix')}\n"
+        f"total    : {get_setting('counter')}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+@admin_only
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    days = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 7
+    data = get_stats(days)
+    if not data["rows"]:
+        await update.message.reply_text("no history.")
+        return
+    lines = [f"{d}  {cc}  ×{n}" for d, cc, n in data["rows"]]
+    await update.message.reply_text("📈 last %sd:\n%s" % (days, "\n".join(lines[:60])))
+
+@admin_only
+async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"🩺 <b>health</b>\n"
+        f"db        : <code>{DB_PATH}</code>\n"
+        f"log       : <code>{LOG_PATH}</code>\n"
+        f"dry_run   : {get_setting('dry_run')}\n"
+        f"autopost  : {get_setting('autopost')}\n"
+        f"uptime    : {int(time.time() - START_TS)}s\n"
+        f"countries : {len(COUNTRIES)}\n"
+        f"copy btn  : {'yes' if _COPY_SUPPORTED else 'no (upgrade PTB)'}\n"
+        f"color btn : {'yes' if _STYLE_SUPPORTED else 'no (upgrade PTB >= 21.11)'}\n"
+        f"admins    : {len(list_admins()) + 1}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+# ═════════════════════════════════════════════════════════════
+# CALLBACKS
+# ═════════════════════════════════════════════════════════════
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    uid = q.from_user.id if q.from_user else 0
+    if not is_admin(uid):
+        try:
+            await q.answer("not authorized", show_alert=False)
+        except TelegramError:
+            pass
+        return
+
+    data = q.data or ""
+
+    if data == "cc:__close__":
+        try:
+            await q.message.delete()
+        except TelegramError:
+            pass
+        try:
+            await q.answer()
+        except TelegramError:
+            pass
+        return
+
+    if data.startswith("cc:"):
+        cc = data[3:].upper()
+        if cc in COUNTRIES:
+            set_setting("country", cc)
+            try:
+                await q.answer(f"country → {cc} ({COUNTRIES[cc].label})")
+            except TelegramError:
+                pass
+            try:
+                await q.edit_message_text(
+                    f"🌍 Selected: {COUNTRIES[cc].flag} <b>{cc}</b> — {COUNTRIES[cc].label}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=country_menu_kb(),
+                )
+            except TelegramError:
+                pass
+        else:
+            try:
+                await q.answer("unknown code")
+            except TelegramError:
+                pass
+        return
+
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+
+# ═════════════════════════════════════════════════════════════
+# POST-INIT
+# ═════════════════════════════════════════════════════════════
+async def post_init(app: Application) -> None:
+    cmds = [
+        BotCommand("send",        "post one OTP now"),
+        BotCommand("preview",     "preview OTP in DM"),
+        BotCommand("menu",        "country picker"),
+        BotCommand("start_auto",  "enable autopost"),
+        BotCommand("stop_auto",   "disable autopost"),
+        BotCommand("speed",       "set cadence window"),
+        BotCommand("active",      "set posting window"),
+        BotCommand("country",     "set active country"),
+        BotCommand("countries",   "list countries"),
+        BotCommand("template",    "show template"),
+        BotCommand("settemplate", "set template"),
+        BotCommand("broadcast",   "send announcement"),
+        BotCommand("pin",         "pin announcement"),
+        BotCommand("stats",       "config snapshot"),
+        BotCommand("history",     "posting history"),
+        BotCommand("health",      "health check"),
+        BotCommand("start",       "command list"),
+    ]
+    try:
+        await app.bot.set_my_commands(cmds)
+    except TelegramError as e:
+        log.warning("set_my_commands failed: %s", e)
+
+    app.create_task(autopost_loop(app))
+    log.info("bot initialised, autopost loop started")
+
+# ═════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════
+START_TS = time.time()
+
+def main() -> None:
+    db_init()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start",         cmd_start))
+    app.add_handler(CommandHandler("send",          cmd_send))
+    app.add_handler(CommandHandler("preview",       cmd_preview))
+    app.add_handler(CommandHandler("menu",          cmd_menu))
+    app.add_handler(CommandHandler("country_menu",  cmd_country_menu))
+    app.add_handler(CommandHandler("start_auto",    cmd_start_auto))
+    app.add_handler(CommandHandler("stop_auto",     cmd_stop_auto))
+    app.add_handler(CommandHandler("speed",         cmd_speed))
+    app.add_handler(CommandHandler("active",        cmd_active))
+    app.add_handler(CommandHandler("dryrun",        cmd_dryrun))
+    app.add_handler(CommandHandler("setgroup",      cmd_setgroup))
+    app.add_handler(CommandHandler("setlinks",      cmd_setlinks))
+    app.add_handler(CommandHandler("setprefix",     cmd_setprefix))
+    app.add_handler(CommandHandler("country",       cmd_country))
+    app.add_handler(CommandHandler("countries",     cmd_countries))
+    app.add_handler(CommandHandler("template",      cmd_template))
+    app.add_handler(CommandHandler("settemplate",   cmd_settemplate))
+    app.add_handler(CommandHandler("resettemplate", cmd_resettemplate))
+    app.add_handler(CommandHandler("broadcast",     cmd_broadcast))
+    app.add_handler(CommandHandler("pin",           cmd_pin))
+    app.add_handler(CommandHandler("note",          cmd_note))
+    app.add_handler(CommandHandler("addadmin",      cmd_addadmin))
+    app.add_handler(CommandHandler("deladmin",      cmd_deladmin))
+    app.add_handler(CommandHandler("admins",        cmd_admins))
+    app.add_handler(CommandHandler("stats",         cmd_stats))
+    app.add_handler(CommandHandler("history",       cmd_history))
+    app.add_handler(CommandHandler("health",        cmd_health))
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, lambda u, c: None))
+
+    log.info("starting bot…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
