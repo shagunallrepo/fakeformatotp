@@ -1,0 +1,5 @@
+python-telegram-bot==21.6
+Jinja2==3.1.4
+aiosqlite==0.20.0
+Jinja2==3.1.4
+python-dotenv==1.0.1
