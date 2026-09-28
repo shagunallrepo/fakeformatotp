@@ -52,9 +52,9 @@ except ImportError:  # older PTB
 # ═════════════════════════════════════════════════════════════
 # CONFIG
 # ═════════════════════════════════════════════════════════════
-BOT_TOKEN        = os.getenv("OTP_BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")
-OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "123456789"))
-DEFAULT_GROUP_ID = int(os.getenv("OTP_GROUP_ID", "-1001234567890"))
+BOT_TOKEN        = os.getenv("OTP_BOT_TOKEN", "8835130188:AAEg-VUmb5xe9rSRIhP-n-PdYTVKSomOV3k")
+OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "8129003140"))
+DEFAULT_GROUP_ID = int(os.getenv("OTP_GROUP_ID", "-1003652361706"))
 DB_PATH          = os.getenv("OTP_DB_PATH", "otp_bot.sqlite3")
 LOG_PATH         = os.getenv("OTP_LOG_PATH", "otp_bot.log")
 DRY_RUN          = os.getenv("OTP_DRY_RUN", "0") == "1"
@@ -62,9 +62,9 @@ DRY_RUN          = os.getenv("OTP_DRY_RUN", "0") == "1"
 # ─────────────────────────────────────────────────────────────
 # BUTTON URLS — paste your own values here
 # ─────────────────────────────────────────────────────────────
-NUMBERS_URL = "https://t.me/your_numbers_channel"
-CHAT_URL    = "https://t.me/your_chat"
-BOT_URL     = "https://t.me/your_bot"
+NUMBERS_URL = "https://t.me/kitenumber"
+CHAT_URL    = "https://t.me/kitechatt"
+BOT_URL     = "https://t.me/kiteotp_bot"
 
 # Show a "Tap to copy" row above the three link buttons.
 # Only takes effect if installed PTB supports CopyTextButton.
