@@ -320,9 +320,9 @@ def build_keyboard(raw_code: str) -> InlineKeyboardMarkup:
         ])
 
     rows.append([
-        InlineKeyboardButton("📞 Numbers", url=get_setting("numbers_url") or NUMBERS_URL),
-        InlineKeyboardButton("💬 Chat",    url=get_setting("chat_url")    or CHAT_URL),
-        InlineKeyboardButton("🤖 Bot",     url=get_setting("bot_url")     or BOT_URL),
+        InlineKeyboardButton("𝗡𝘂𝗺𝗯𝗲𝗿𝘀", url=get_setting("numbers_url") or NUMBERS_URL),
+        InlineKeyboardButton("𝗖𝗵𝗮𝘁",    url=get_setting("chat_url")    or CHAT_URL),
+        InlineKeyboardButton("𝗕𝗼𝘁",     url=get_setting("bot_url")     or BOT_URL),
     ])
 
     return InlineKeyboardMarkup(rows)
