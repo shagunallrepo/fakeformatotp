@@ -74,7 +74,7 @@ def _btn(label: str, *, url: Optional[str] = None,
 # CONFIG
 # ═════════════════════════════════════════════════════════════
 BOT_TOKEN        = os.getenv("OTP_BOT_TOKEN", "8835130188:AAEg-VUmb5xe9rSRIhP-n-PdYTVKSomOV3k")
-OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "8129003140"))
+OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "8129003140", "8913693655"))
 DEFAULT_GROUP_ID = int(os.getenv("OTP_GROUP_ID", "-1003652361706"))
 DB_PATH          = os.getenv("OTP_DB_PATH", "otp_bot.sqlite3")
 LOG_PATH         = os.getenv("OTP_LOG_PATH", "otp_bot.log")
