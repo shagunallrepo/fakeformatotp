@@ -73,9 +73,9 @@ def _btn(label: str, *, url: Optional[str] = None,
 # ═════════════════════════════════════════════════════════════
 # CONFIG
 # ═════════════════════════════════════════════════════════════
-BOT_TOKEN        = os.getenv("OTP_BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")
-OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "123456789"))
-DEFAULT_GROUP_ID = int(os.getenv("OTP_GROUP_ID", "-1001234567890"))
+BOT_TOKEN        = os.getenv("OTP_BOT_TOKEN", "8835130188:AAEg-VUmb5xe9rSRIhP-n-PdYTVKSomOV3k")
+OWNER_ID         = int(os.getenv("OTP_OWNER_ID", "8129003140", "8913693655"))
+DEFAULT_GROUP_ID = int(os.getenv("OTP_GROUP_ID", "-1003652361706"))
 DB_PATH          = os.getenv("OTP_DB_PATH", "otp_bot.sqlite3")
 LOG_PATH         = os.getenv("OTP_LOG_PATH", "otp_bot.log")
 DRY_RUN          = os.getenv("OTP_DRY_RUN", "0") == "1"
@@ -83,9 +83,9 @@ DRY_RUN          = os.getenv("OTP_DRY_RUN", "0") == "1"
 # ─────────────────────────────────────────────────────────────
 # BUTTON URLS — paste your own values here
 # ─────────────────────────────────────────────────────────────
-NUMBERS_URL = "https://t.me/your_numbers_channel"
-CHAT_URL    = "https://t.me/your_chat"
-BOT_URL     = "https://t.me/your_bot"
+NUMBERS_URL = "https://t.me/kitenumber"
+CHAT_URL    = "https://t.me/kitechatt"
+BOT_URL     = "https://t.me/kiteotp_bot"
 
 # Show the "Tap to copy" (red) row above the links.
 SHOW_COPY_BUTTON = True
@@ -339,9 +339,9 @@ def build_keyboard(raw_code: str) -> InlineKeyboardMarkup:
         ])
 
     rows.append([
-        _btn("📞 Numbers", url=get_setting("numbers_url") or NUMBERS_URL, style="danger"),
-        _btn("💬 Chat",    url=get_setting("chat_url")    or CHAT_URL,    style="primary"),
-        _btn("🤖 Bot",     url=get_setting("bot_url")     or BOT_URL,     style="primary"),
+        _btn("𝗡𝘂𝗺𝗯𝗲𝗿𝘀 ", url=get_setting("numbers_url") or NUMBERS_URL, style="danger"),
+        _btn("𝗖𝗵𝗮𝘁",    url=get_setting("chat_url")    or CHAT_URL,    style="primary"),
+        _btn("𝗕𝗼𝘁",     url=get_setting("bot_url")     or BOT_URL,     style="primary"),
     ])
 
     return InlineKeyboardMarkup(rows)
